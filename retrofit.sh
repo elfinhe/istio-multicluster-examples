@@ -121,7 +121,7 @@ EOF
   sleep 5
 }
 
-function swap_istio_secrets {
+function copy_istio_secrets {
   local KUBECTL_SRC="${1:?required argument is not set or empty}"
   local KUBECTL_DST="${2:?required argument is not set or empty}"
 
@@ -131,7 +131,8 @@ function swap_istio_secrets {
   $KUBECTL_DST -n istio-system delete secret istio-ca-secret || true
   $KUBECTL_DST -n istio-system delete secret cacerts || true
 
-  for ns in `$KUBECTL_DST get ns -o=name`; do
+  for ns in `$KUBECTL_DST get ns -o=jsonpath="{.items[*].metadata.name}"`; do
+    echo $ns
     $KUBECTL_DST -n $ns delete secret istio.default || true
   done
 
@@ -154,7 +155,7 @@ function swap_istio_secrets {
 function rekick_deployments {
   local KUBECTL="${1:?required argument is not set or empty}"
 
-  for ns in `$KUBECTL get ns -o=name`; do
+  for ns in `$KUBECTL get ns -o=jsonpath="{.items[*].metadata.name}"`; do
     if [[ ! $ns =~ ^namespace/kube- ]]; then
       for depl in `$KUBECTL -n $ns get deployment -o=name`; do
         $KUBECTL -n $ns patch $depl -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"date\":\"`date +'%s'`\"}}}}}"
@@ -162,7 +163,7 @@ function rekick_deployments {
     fi
   done
 
-  for ns in `$KUBECTL get ns -o=name`; do
+  for ns in `$KUBECTL get ns -o=jsonpath="{.items[*].metadata.name}"`; do
     if [[ ! $ns =~ ^namespace/kube- ]]; then
       for depl in `$KUBECTL -n $ns get deployment -o=name`; do
         $KUBECTL -n $ns rollout status $depl || true
@@ -204,7 +205,7 @@ KUBECTL1="kubectl --kubeconfig=${KUBECONFIG1} --context=${KUBECONTEXT1}"
 KUBECTL2="kubectl --kubeconfig=${KUBECONFIG2} --context=${KUBECONTEXT2}"
 
 echo -e "\n [*] replacing Istio secrets in the second cluster with secrets from the first cluster ... \n"
-swap_istio_secrets "$KUBECTL1" "$KUBECTL2"
+copy_istio_secrets "$KUBECTL1" "$KUBECTL2"
 echo -e "\n [OK] replaced Istio secrets \n"
 
 echo -e "\n [*] rekicking all deployments ... \n"
