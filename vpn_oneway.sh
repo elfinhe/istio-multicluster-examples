@@ -219,16 +219,16 @@ function install_istio {
 
   helm template $ISTIO_DIR --name istio \
     --namespace istio-system \
-    -f $ISTIO_DIR/example-values/values-istio-multicluster-gateways.yaml \
+    --set global.controlPlaneSecurityEnabled=true \
+    --set global.mtls.enabled=true \
+    --set security.selfSigned=false \
     | $KUBECTL apply -f -
 }
 
 function await_istio_rollout {
   local KUBECTL="${1:?required argument is not set or empty}"
 
-  $KUBECTL -n istio-system rollout status deployment istiocoredns
   $KUBECTL -n istio-system rollout status deployment istio-ingressgateway
-  $KUBECTL -n istio-system rollout status deployment istio-egressgateway
 }
 
 function configure_dns {
@@ -248,12 +248,11 @@ EOF
 }
 
 function install_probe {
-  local KUBECTL_SRV="${1:?required argument is not set or empty}"
-  local KUBECTL_CLI="${2:?required argument is not set or empty}"
+  local KUBECTL="${1:?required argument is not set or empty}"
 
-  $KUBECTL_SRV create ns test || true
-  $KUBECTL_SRV label --overwrite=true ns test istio-injection=enabled || true
-  $KUBECTL_SRV apply -f - <<EOF
+  $KUBECTL create ns test || true
+  $KUBECTL label --overwrite=true ns test istio-injection=enabled || true
+  $KUBECTL apply -f - <<EOF
 apiVersion: v1
 kind: Service
 metadata:
@@ -286,56 +285,66 @@ spec:
         - server
 EOF
 
-  $KUBECTL_SRV -n test rollout status deployment test-srv
+  $KUBECTL -n test rollout status deployment test-srv
 
-  local SRV_GATEWAY_IP
-  while true; do
-    SRV_GATEWAY_IP=$($KUBECTL_SRV -n istio-system \
-      get svc istio-ingressgateway \
-      -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-    if [[ -z $SRV_GATEWAY_IP ]]; then
-      echo "awaiting IngressGateway external IP address provisioning..."
-      sleep 3
-    else
-      echo "discovered IngressGateway external IP address: ${SRV_GATEWAY_IP}"
-      break
-    fi
-  done
+  sleep 5
+}
 
-  $KUBECTL_CLI create ns test || true
-  $KUBECTL_CLI label --overwrite=true ns test istio-injection=enabled || true
-  $KUBECTL_CLI apply -f - <<EOF
-apiVersion: networking.istio.io/v1alpha3
-kind: ServiceEntry
-metadata:
-  name: test-srv-global
-  namespace: test
-spec:
-  hosts:
-  # must be of form name.namespace.global
-  - test-srv.test.global
-  # Treat remote cluster services as part of the service mesh
-  # as all clusters in the service mesh share the same root of trust.
-  location: MESH_INTERNAL
-  ports:
-  - name: http1
-    number: 8080
-    protocol: http
-  resolution: DNS
-  addresses:
-  # the IP address to which httpbin.bar.global will resolve to
-  # must be unique for each remote service, within a given cluster.
-  # This address need not be routable. Traffic for this IP will be captured
-  # by the sidecar and routed appropriately.
-  - 127.255.0.2
-  endpoints:
-  # This is the routable address of the ingress gateway in cluster2 that
-  # sits in front of sleep.foo service. Traffic from the sidecar will be
-  # routed to this address.
-  - address: ${SRV_GATEWAY_IP}
-    ports:
-      http1: 15443 # Do not change this port value
+function check_probe {
+  local KUBECTL="${1:?required argument is not set or empty}"
+
+  local POD=$($KUBECTL -n test get pod -l app=test-srv -o jsonpath="{.items[0].metadata.name}")
+  $KUBECTL -n test exec -it $POD -c fortio-server -- fortio curl http://test-srv.test.svc.cluster.local:8080/debug?env=dump
+}
+
+function install_slave_cluster_secrets {
+  local KUBECONFIG_MASTER="${1:?required argument is not set or empty}"
+  local KUBECONTEXT_MASTER="${2:?required argument is not set or empty}"
+  local KUBECONFIG_SLAVE="${3:?required argument is not set or empty}"
+  local KUBECONTEXT_SLAVE="${4:?required argument is not set or empty}"
+
+  local KUBECTL_MASTER="kubectl --kubeconfig=${KUBECONFIG_MASTER} --context=${KUBECONTEXT_MASTER}"
+  local KUBECTL_SLAVE="kubectl --kubeconfig=${KUBECONFIG_SLAVE} --context=${KUBECONTEXT_SLAVE}"
+
+  local CLUSTER_NAME=$($KUBECTL_SLAVE config view -o jsonpath="{.contexts[?(@.name == \"${KUBECONTEXT_SLAVE}\")].context.cluster}")
+  local SERVER=$($KUBECTL_SLAVE config view -o jsonpath="{.clusters[?(@.name == \"${CLUSTER_NAME}\")].cluster.server}")
+  local NAMESPACE=istio-system
+  local SERVICE_ACCOUNT=istio-pilot-service-account
+  local SECRET_NAME=$($KUBECTL_SLAVE get sa ${SERVICE_ACCOUNT} -n ${NAMESPACE} -o jsonpath="{.secrets[].name}")
+  local CA_DATA=$($KUBECTL_SLAVE get secret ${SECRET_NAME} -n ${NAMESPACE} -o jsonpath="{.data['ca\.crt']}")
+  local TOKEN=$($KUBECTL_SLAVE get secret ${SECRET_NAME} -n ${NAMESPACE} -o jsonpath="{.data['token']}" | base64 --decode)
+
+  local TEMP_DIR=$(mktemp -d)
+  local KUBECFG_FILE=$TEMP_DIR/kubeconfig
+
+  cat > $KUBECFG_FILE <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    certificate-authority-data: ${CA_DATA}
+    server: ${SERVER}
+  name: ${CLUSTER_NAME}
+contexts:
+- context:
+    cluster: ${CLUSTER_NAME}
+    user: ${CLUSTER_NAME}
+  name: ${CLUSTER_NAME}
+current-context: ${CLUSTER_NAME}
+
+preferences: {}
+users:
+- name: ${CLUSTER_NAME}
+  user:
+    token: ${TOKEN}
 EOF
+
+  local SECRET_NAME=$(cat /dev/urandom | env LC_CTYPE=C tr -dc 'a-z0-9' | fold -w 32 | head -n 1)
+
+  $KUBECTL_MASTER create secret generic ${SECRET_NAME} --from-file ${KUBECFG_FILE} -n ${NAMESPACE}
+  $KUBECTL_MASTER label secret ${SECRET_NAME} istio/multiCluster=true -n ${NAMESPACE}
+
+  rm -rf $TEMP_DIR
 
   sleep 5
 }
@@ -361,14 +370,6 @@ function check_probe_multicluster {
 
   echo "never received response from any other host"
   return 1
-}
-
-
-function check_probe {
-  local KUBECTL="${1:?required argument is not set or empty}"
-
-  local POD=$($KUBECTL -n test get pod -l app=test-srv -o jsonpath="{.items[0].metadata.name}")
-  $KUBECTL -n test exec -it $POD -c fortio-server -- fortio curl http://test-srv.test.global:8080/debug
 }
 
 ### main block
@@ -402,20 +403,20 @@ install_istio "$KUBECTL1" "${ISTIO_DIST_DIR}/istio"
 install_istio "$KUBECTL2" "${ISTIO_DIST_DIR}/istio"
 echo -e "\n [OK] installed Istio \n"
 
-echo -e "\n [*] configuring kube-dns ... \n"
-configure_dns "$KUBECTL1"
-configure_dns "$KUBECTL2"
-echo -e "\n [OK] configured kube-dns \n"
-
 echo -e "\n [*] waiting till everything's running ... \n"
 await_istio_rollout "$KUBECTL1"
 await_istio_rollout "$KUBECTL2"
 echo -e "\n [OK] looks like everything's running \n"
 
 echo -e "\n [*] installing probe apps ... \n"
-install_probe "$KUBECTL1" "$KUBECTL2"
-install_probe "$KUBECTL2" "$KUBECTL1"
+install_probe "$KUBECTL1"
+install_probe "$KUBECTL2"
 echo -e "\n [OK] installed probe apps \n"
+
+echo -e "\n [*] installing K8S API secrets of the remote clusters ... \n"
+install_slave_cluster_secrets "$KUBECONFIG1" "$KUBECONTEXT1" "$KUBECONFIG2" "$KUBECONTEXT2"
+#install_slave_cluster_secrets "$KUBECONFIG2" "$KUBECONTEXT2" "$KUBECONFIG1" "$KUBECONTEXT1"
+echo -e "\n [*] installed K8S API secrets of the remote clusters \n"
 
 echo -e "\n [*] verifying cross-cluster connectivity using probe apps ... \n"
 check_probe "$KUBECTL1"
@@ -428,3 +429,4 @@ check_probe_multicluster "$KUBECTL2"
 echo -e "\n [OK] verified that probe requests are load-balanced between both clusters \n"
 
 echo -e "\n [OK] ALL DONE! \n"
+rm -rf $TEMP_DIR

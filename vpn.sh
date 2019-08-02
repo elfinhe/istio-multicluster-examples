@@ -349,6 +349,29 @@ EOF
   sleep 5
 }
 
+function check_probe_multicluster {
+  local KUBECTL="${1:?required argument is not set or empty}"
+
+  local POD=$($KUBECTL -n test get pod -l app=test-srv -o jsonpath="{.items[0].metadata.name}")
+  local SVCADDR1=$($KUBECTL -n test exec -it $POD -c fortio-server -- \
+    fortio curl http://test-srv.test.svc.cluster.local:8080/debug?env=dump \
+    | grep "^TEST_SRV_SERVICE_HOST=")
+  echo "received response from: $SVCADDR1"
+
+  for i in {1..10}; do
+    local SVCADDR2=$($KUBECTL -n test exec -it $POD -c fortio-server -- \
+      fortio curl http://test-srv.test.svc.cluster.local:8080/debug?env=dump \
+      | grep "^TEST_SRV_SERVICE_HOST=")
+    if [[ $SVCADDR1 != $SVCADDR2 ]]; then
+      echo "received response from: $SVCADDR2"
+      return 0
+    fi
+  done
+
+  echo "never received response from any other host"
+  return 1
+}
+
 ### main block
 
 TEMP_DIR=$(mktemp -d)
@@ -399,6 +422,11 @@ echo -e "\n [*] verifying cross-cluster connectivity using probe apps ... \n"
 check_probe "$KUBECTL1"
 check_probe "$KUBECTL2"
 echo -e "\n [OK] successfully verified cross-cluster connectivity using probe apps \n"
+
+echo -e "\n [*] verifying that probe requests are load-balanced between both clusters... \n"
+check_probe_multicluster "$KUBECTL1"
+check_probe_multicluster "$KUBECTL2"
+echo -e "\n [OK] verified that probe requests are load-balanced between both clusters \n"
 
 echo -e "\n [OK] ALL DONE! \n"
 rm -rf $TEMP_DIR
