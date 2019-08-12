@@ -339,7 +339,46 @@ EOF
 
   $KUBECTL -n test rollout status deployment test-srv
 
-  sleep 5
+  sleep 3
+}
+
+function delete_probe {
+  local KUBECTL="${1:?required argument is not set or empty}"
+
+  $KUBECTL delete -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-srv
+  namespace: test
+spec:
+  ports:
+  - port: 8080
+    name: http-echo
+  selector:
+    app: test-srv
+---
+apiVersion: apps/v1beta1
+kind: Deployment
+metadata:
+  name: test-srv
+  namespace: test
+spec:
+  template:
+    metadata:
+      labels:
+        app: test-srv
+    spec:
+      containers:
+      - name: fortio-server
+        image: fortio/fortio
+        ports:
+        - containerPort: 8080
+        args:
+        - server
+EOF
+
+  $KUBECTL delete ns test || true
 }
 
 function check_probe {
